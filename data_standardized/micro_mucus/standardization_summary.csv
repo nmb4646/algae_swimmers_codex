@@ -1,0 +1,2 @@
+file_name,n_input_points,n_output_points,pix_m_per_px,native_dt_s,target_dt_s,output_file
+1.csv,349,329,4.8e-07,0.0571428571428571,0.0606060606060606,./data_standardized/micro_mucus/1.csv

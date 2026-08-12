@@ -1,0 +1,5 @@
+input_file,output_subdir,output_file,pix_m_per_px,dt_s,zero_origin
+./data/algae_motion/buffer/1.csv,pico_water,1.csv,3.2e-7,0.01,true
+./data/algae_motion/mucus/1.csv,pico_mucus,1.csv,3.2e-7,0.01,true
+./data/algae_motion/buffer_micro/Microalgae in water (1).csv,micro_water,Microalgae in water (1).csv,2.4e-7,0.0606060606,true
+./data/algae_motion/mucus_micro/Microalgae in mucus (1).csv,micro_mucus,Microalgae in mucus (1).csv,2.4e-7,0.0606060606,true

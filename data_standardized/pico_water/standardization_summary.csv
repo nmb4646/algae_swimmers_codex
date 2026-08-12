@@ -1,0 +1,13 @@
+file_name,n_input_points,n_output_points,pix_m_per_px,native_dt_s,target_dt_s,output_file
+37.csv,285,1623,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/37.csv
+38.csv,452,2578,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/38.csv
+39.csv,248,1412,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/39.csv
+40.csv,452,2578,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/40.csv
+41.csv,452,2578,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/41.csv
+42.csv,383,2183,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/42.csv
+43.csv,255,1452,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/43.csv
+44.csv,180,1023,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/44.csv
+45.csv,518,2955,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/45.csv
+46.csv,250,1423,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/46.csv
+47.csv,106,601,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/47.csv
+48.csv,471,2686,2.4e-07,0.0571428571428571,0.01,./data_standardized/pico_water/48.csv
