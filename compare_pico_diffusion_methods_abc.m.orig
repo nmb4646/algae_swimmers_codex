@@ -1,0 +1,778 @@
+clear; clc; close all;
+
+%%%% THREE LONG-TIME DIFFUSION METHODS FOR THE SAME PICOALGAE SWIMMERS
+% a: measured v and |omega|, plus thermal sphere D_r.
+% b: measured v and |omega|, plus each swimmer's DACF-fit D_r.
+% c: fit the complete algebraic single-swimmer MSD (Marine Eq. 5), then
+%    calculate D_eff from its fitted v, |omega|, and D_r (Marine Eq. 6).
+% All three use D_eff = D_t + v^2*D_r/[2*(D_r^2+omega^2)] in two dimensions.
+% Marine et al., Phys. Rev. E 87, 052305 (2013):
+% https://doi.org/10.1103/PhysRevE.87.052305
+%
+% Methods a/b/c are recalculated from the SAME curated raw tracks under each
+% trajectory-smoothing setting. For any setting, all three methods receive
+% exactly the same smoothed x/y positions before model calculations.
+% The KDE bandwidth and swimmer cohort stay FIXED across the smoothing
+% sweep. Thus a better overlap cannot be produced merely by broadening one
+% curve or changing which swimmers are present. All settings and scores are
+% exported, not only the chosen setting. This is an IN-SAMPLE descriptive
+% comparison, not an independent validation of a or b.
+
+%%%% INPUTS AND PHYSICAL ASSUMPTIONS
+baseline_csv = "analysis_2jklm_swimmer_parameters.csv";
+baseline_mat = "analysis_2jklm_results.mat";
+kde_reference_mat = "analysis_2jklm_msd_fit_results.mat";
+base_dir = "./data/Picoalgae in 0-2% mucin/";
+condition_dirs = ["picoalgae 0% mucin"; "picoalgae 2% mucin"];
+condition_names = ["0% mucin"; "2% mucin"];
+condition_colors = [0.12,0.47,0.71; 1.00,0.25,0.39];
+fps = 15;
+dt = 1/fps;
+pixel_size_um = 0.48;
+direction_minimum_step_um = 0.05;
+dacf_max_lag_s = 4;
+dacf_min_r_squared = 0;
+dacf_max_Dr_s_inv = 5/dt;
+msd_fit_max_lag_s = 25;
+msd_fit_max_track_fraction = 0.5;
+msd_fit_min_lag_span_s = 4;
+msd_fit_min_r_squared = 0;
+Dt_um2_s = [0;0]; % Hold D_t fixed at the prior a/b/c default.
+
+% The older D2.m and analytic_geometric_msd_comparison.m assume a 1-um
+% radius sphere, T=293 K, and water viscosity of 1 mPa s. The repo has NO
+% measured 2%-mucin viscosity or single-cell sizes. The 2% thermal curve
+% is therefore a WATER-VISCOSITY COUNTERFACTUAL, not a measured D_r for
+% mucin. Do not tune radius or viscosity to make any curves match.
+boltzmann_J_K = 1.380649e-23;
+temperature_K = 293;
+sphere_radius_um = 1.0;
+viscosity_pa_s = [0.001;0.001];
+thermal_Dr_s_inv = boltzmann_J_K*temperature_K ./ ...
+    (8*pi*viscosity_pa_s*(sphere_radius_um*1e-6)^3);
+
+%%%% SHARED TRAJECTORY SMOOTHING FOR METHODS a, b, AND c
+% The 5-frame quadratic setting reproduces the previous method b.
+% Order 0/window 1 means unsmoothed positions.
+sg_order = [0; 2;2;2;2;2; 3;3;3;3;3];
+sg_window_frames = [1; 5;7;9;11;15; 5;7;9;11;15];
+variant_names = strings(numel(sg_order),1);
+for s = 1:numel(sg_order)
+    if sg_window_frames(s) == 1
+        variant_names(s) = "raw";
+    else
+        variant_names(s) = sprintf("SG%d/%d frames", ...
+            sg_order(s), sg_window_frames(s));
+    end
+end
+baseline_variant = find(sg_order==2 & sg_window_frames==5);
+display_sg_order = 2;
+display_sg_window_frames = 7;
+display_variant = find(sg_order==display_sg_order & ...
+    sg_window_frames==display_sg_window_frames);
+assert(isscalar(display_variant), 'Display smoothing must be in the sweep.');
+n_variants = numel(sg_order);
+% A candidate filter must retain at least 95% amplitude of a sinusoid at
+% the WATER ensemble rotation frequency. This is a transparent signal-
+% preservation criterion, not a fit to method c. All more aggressive
+% windows are still evaluated and exported.
+minimum_rotation_amplitude_retained = 0.95;
+
+%%%% DISPLAY AND OUTPUT
+output_stem = "compare_pico_diffusion_methods_abc_sg2_7";
+full_xlim_um2_s = [0,150];
+zoom_xlim_um2_s = [0,40];
+kde_grid_points = 5001;
+kde_bandwidth_factors = [0.75;1;1.25]; % only a sensitivity check
+run_baseline_reproduction_check = true;
+
+%%%% READ PREVIOUS RESULTS ONLY FOR CURATED COHORT AND KDE WIDTH
+% Keep the original comparison's KDE width for like-for-like PDFs. No old
+% method-c coefficients are imported: all a/b/c D_eff values are refitted.
+assert(isfile(baseline_csv) && isfile(baseline_mat) && ...
+    isfile(kde_reference_mat), ...
+    'Run analysis_2jklm.m in DACF and MSD-fit modes first.');
+prior = readtable(baseline_csv, 'TextType', 'string');
+saved = load(kde_reference_mat, 'settings');
+baseline_saved = load(baseline_mat, 'results');
+water_rotation_period_s = baseline_saved.results(1).dacf_fit.period_s;
+assert(isfinite(water_rotation_period_s) && water_rotation_period_s>0);
+test_time = (0:600)'*dt;
+test_wave = sin(2*pi*test_time/water_rotation_period_s);
+test_interior = 51:(numel(test_time)-50);
+rotation_amplitude_retained = nan(n_variants,1);
+for s = 1:n_variants
+    smoothed_test = smooth_track([test_wave,zeros(size(test_wave))], ...
+        sg_order(s),sg_window_frames(s));
+    rotation_amplitude_retained(s) = norm( ...
+        smoothed_test(test_interior,1))/norm(test_wave(test_interior));
+end
+kde_bandwidth_log = saved.settings.diffusion_bandwidth_log;
+assert(isfinite(kde_bandwidth_log) && kde_bandwidth_log>0);
+assert(numel(unique(prior.condition+"|"+prior.file))==height(prior));
+
+n_swimmers = height(prior);
+condition_index = zeros(n_swimmers,1);
+raw_trajectories = cell(n_swimmers,1);
+for k = 1:n_swimmers
+    condition_index(k) = find(condition_names==prior.condition(k), 1);
+    assert(~isempty(condition_index(k)), 'Unexpected condition label.');
+    path = fullfile(base_dir, condition_dirs(condition_index(k)), prior.file(k));
+    raw_trajectories{k} = read_curated_track(path, pixel_size_um, dt);
+end
+
+speed_um_s = nan(n_variants,n_swimmers);
+omega_rad_s = nan(n_variants,n_swimmers);
+dacf_Dr_s_inv = nan(n_variants,n_swimmers);
+dacf_r_squared = nan(n_variants,n_swimmers);
+a_values = nan(n_variants,n_swimmers);
+b_values = nan(n_variants,n_swimmers);
+c_values = nan(n_variants,n_swimmers);
+b_included = false(n_variants,n_swimmers);
+c_included = false(n_variants,n_swimmers);
+c_fit_r_squared = nan(n_variants,n_swimmers);
+
+%%%% RECOMPUTE ALL THREE METHODS FROM EACH IDENTICALLY SMOOTHED TRACK
+for s = 1:n_variants
+    fprintf('Computing %s (%d/%d)...\n', ...
+        variant_names(s), s, n_variants);
+    for k = 1:n_swimmers
+        xy = smooth_track(raw_trajectories{k}, ...
+            sg_order(s), sg_window_frames(s));
+        [v, omega, lag, correlation, pairs] = ... 
+            track_motion_and_dacf(xy, dt, dacf_max_lag_s, ...
+            direction_minimum_step_um);
+        speed_um_s(s,k) = v;
+        omega_rad_s(s,k) = omega;
+        c = condition_index(k);
+        a_values(s,k) = circle_diffusion(v,omega, ...
+            thermal_Dr_s_inv(c),Dt_um2_s(c));
+        [Dr, r_squared, reached_upper_bound, converged] = ...
+            fit_individual_Dr(lag,correlation,pairs,omega,dacf_max_Dr_s_inv);
+        dacf_Dr_s_inv(s,k) = Dr;
+        dacf_r_squared(s,k) = r_squared;
+        b_values(s,k) = circle_diffusion(v,omega,Dr,Dt_um2_s(c));
+        b_included(s,k) = converged && ~reached_upper_bound && ...
+            isfinite(r_squared) && r_squared>=dacf_min_r_squared && ...
+            isfinite(b_values(s,k)) && b_values(s,k)>0;
+        [c_values(s,k),c_included(s,k),c_fit_r_squared(s,k)] = ...
+            fit_msd_track_diffusion(xy,dt,msd_fit_max_lag_s, ...
+            msd_fit_max_track_fraction,msd_fit_min_lag_span_s, ...
+            Dt_um2_s(c),dacf_max_Dr_s_inv,msd_fit_min_r_squared);
+    end
+end
+
+%%%% EXACTLY REPRODUCE THE PRIOR b METHOD AT SG2/5
+if run_baseline_reproduction_check
+    k = baseline_variant;
+    assert(max(abs(speed_um_s(k,:)'-prior.mean_speed_um_s),[],'omitnan')<1e-8);
+    assert(max(abs(omega_rad_s(k,:)'-prior.omega_rad_s),[],'omitnan')<1e-8);
+    assert(max(abs(dacf_Dr_s_inv(k,:)'-prior.Dr_s_inv),[],'omitnan')<1e-7);
+    assert(max(abs(b_values(k,:)'-prior.Deff_um2_s),[],'omitnan')<1e-6);
+    assert(isequal(b_included(k,:)', ...
+        logical(prior.included_in_diffusion_pdf)));
+    fprintf('SG2/5 reproduces the previous per-swimmer DACF method.\n');
+end
+
+%%%% FIX ONE SWIMMER COHORT AND ONE BANDWIDTH BEFORE COMPARING SETTINGS
+common = all(c_included & isfinite(c_values) & c_values>0,1)' & ...
+    all(b_included,1)' & all(isfinite(a_values) & a_values>0,1)';
+group_index = cell(numel(condition_names),1);
+for c = 1:numel(condition_names)
+    group_index{c} = find(common & condition_index==c);
+    assert(numel(group_index{c})>=10, ...
+        'Too few common swimmers for a fair smoothing comparison.');
+    fprintf('%s: %d matched swimmers across all %d settings.\n', ...
+        condition_names(c),numel(group_index{c}),n_variants);
+end
+
+% In z=log(D), the KDE is Gaussian. This overlap integral is invariant to
+% transforming back to a PDF in physical D units and is stable in the tails.
+all_positive_values = [a_values(:,common); b_values(:,common); ...
+    c_values(:,common)];
+all_positive_values = all_positive_values(:);
+z_limits = [min(log(all_positive_values))- ...
+    6*max(kde_bandwidth_factors)*kde_bandwidth_log, ...
+    max(log(all_positive_values))+ ...
+    6*max(kde_bandwidth_factors)*kde_bandwidth_log];
+z_grid = linspace(z_limits(1),z_limits(2),kde_grid_points);
+overlap_a = nan(n_variants,numel(condition_names));
+overlap_b = nan(n_variants,numel(condition_names));
+for c = 1:numel(condition_names)
+    idx = group_index{c};
+    for s = 1:n_variants
+        c_pdf_z = gaussian_log_pdf(c_values(s,idx),z_grid,kde_bandwidth_log);
+        a_pdf_z = gaussian_log_pdf( ...
+            a_values(s,idx),z_grid,kde_bandwidth_log);
+        b_pdf_z = gaussian_log_pdf( ...
+            b_values(s,idx),z_grid,kde_bandwidth_log);
+        overlap_a(s,c) = trapz(z_grid,min(a_pdf_z,c_pdf_z));
+        overlap_b(s,c) = trapz(z_grid,min(b_pdf_z,c_pdf_z));
+    end
+end
+
+% Report overlap sensitivity, but do not select preprocessing solely to
+% maximize method agreement. The displayed SG2/7 setting is fixed above.
+average_overlap = [mean(overlap_a,2),mean(overlap_b,2)];
+filter_span_s = (sg_window_frames-1)*dt;
+eligible_smoothing = rotation_amplitude_retained >= ...
+    minimum_rotation_amplitude_retained;
+assert(any(eligible_smoothing) && eligible_smoothing(baseline_variant));
+eligible_scores = average_overlap;
+eligible_scores(~eligible_smoothing,:) = -Inf;
+top_eligible_score = max(eligible_scores(:));
+% Two nearly identical central SG curves need not imply two meaningful
+% smoothing choices; within 0.002 overlap prefer shorter/lower-order SG.
+near_best = find(eligible_scores >= top_eligible_score-0.002);
+[candidate_variant,candidate_method] = ind2sub( ...
+    size(average_overlap),near_best);
+[~,priority] = sortrows([sg_window_frames(candidate_variant), ...
+    sg_order(candidate_variant),-eligible_scores(near_best)]);
+best_eligible_variant = candidate_variant(priority(1));
+best_eligible_method_index = candidate_method(priority(1));
+selected_variant = display_variant;
+[~,selected_method_index] = max(average_overlap(selected_variant,:));
+best_score = average_overlap(selected_variant,selected_method_index);
+[unrestricted_score, unrestricted_index] = max(average_overlap(:));
+[unrestricted_variant, unrestricted_method_index] = ind2sub( ...
+    size(average_overlap),unrestricted_index);
+method_names = ["a: thermal D_r (water-viscosity reference)", ...
+    "b: swimmer DACF D_r"];
+fprintf('Displayed shared preprocessing: %s, %s; overlap with c = %.3f.\n', ...
+    variant_names(selected_variant),method_names(selected_method_index),best_score);
+fprintf('Best eligible overlap: %s, %s; overlap = %.3f.\n', ...
+    variant_names(best_eligible_variant), ...
+    method_names(best_eligible_method_index), ...
+    average_overlap(best_eligible_variant,best_eligible_method_index));
+fprintf('Unrestricted visual best: %s, %s; mean overlap = %.3f; ', ...
+    variant_names(unrestricted_variant), ...
+    method_names(unrestricted_method_index),unrestricted_score);
+fprintf('retains %.1f%% of rotation-frequency amplitude.\n', ...
+    100*rotation_amplitude_retained(unrestricted_variant));
+fprintf('Selected filter retains %.1f%% (required %.0f%%).\n', ...
+    100*rotation_amplitude_retained(selected_variant), ...
+    100*minimum_rotation_amplitude_retained);
+fprintf('Overlaps at selected setting, 0%%/2%%: a %.3f/%.3f; b %.3f/%.3f.\n', ...
+    overlap_a(selected_variant,:),overlap_b(selected_variant,:));
+
+% The overlap audit uses the fixed C-selected h. Check whether the a/b
+% conclusion survives plausible KDE bandwidth changes, without using
+% those changes to choose or redraw the main figure.
+bandwidth_check = table();
+checked_variants = unique([baseline_variant;selected_variant; ...
+    unrestricted_variant],'stable');
+for j = 1:numel(checked_variants)
+    s = checked_variants(j);
+    for f = 1:numel(kde_bandwidth_factors)
+        h = kde_bandwidth_log*kde_bandwidth_factors(f);
+        for c = 1:numel(condition_names)
+            idx = group_index{c};
+            q_c = gaussian_log_pdf(c_values(s,idx),z_grid,h);
+            q_a = gaussian_log_pdf(a_values(s,idx),z_grid,h);
+            q_b = gaussian_log_pdf(b_values(s,idx),z_grid,h);
+            row = table(variant_names(s),kde_bandwidth_factors(f), ...
+                condition_names(c),trapz(z_grid,min(q_a,q_c)), ...
+                trapz(z_grid,min(q_b,q_c)), ...
+                'VariableNames',{'smoothing','kde_bandwidth_factor', ...
+                'condition','overlap_a_with_c','overlap_b_with_c'});
+            bandwidth_check = [bandwidth_check;row]; %#ok<AGROW>
+        end
+    end
+end
+
+%%%% BUILD THE THREE PHYSICAL-UNIT PDFs WITH EXACTLY THE SAME KDE
+positive_x = unique([linspace(1e-4,full_xlim_um2_s(2),1201), ...
+    exp(linspace(z_limits(1),z_limits(2),kde_grid_points))]);
+x_grid = [0,positive_x];
+pdfs = cell(numel(condition_names),3);
+values = cell(numel(condition_names),3);
+peaks = nan(numel(condition_names),3);
+full_area = nan(numel(condition_names),3);
+for c = 1:numel(condition_names)
+    idx = group_index{c};
+    values{c,1} = a_values(selected_variant,idx)';
+    values{c,2} = b_values(selected_variant,idx)';
+    values{c,3} = c_values(selected_variant,idx)';
+    for method = 1:3
+        pdfs{c,method} = positive_log_kde( ...
+            values{c,method},x_grid,kde_bandwidth_log);
+        full_area(c,method) = trapz(x_grid,pdfs{c,method});
+        assert(abs(full_area(c,method)-1)<0.002, ...
+            'The full-support diffusion PDF must integrate to one.');
+        [~,peak_index] = max(pdfs{c,method});
+        peaks(c,method) = x_grid(peak_index);
+    end
+end
+
+%%%% MANUSCRIPT-STYLE FIGURE: FULL RANGE AND PEAK ZOOM
+fig = figure('Color','w','Position',[60,80,1500,900]);
+layout = tiledlayout(fig,2,2,'TileSpacing','compact','Padding','loose');
+title(layout,'Long-time diffusion: three estimation methods', ...
+    'FontName','Arial','FontSize',19,'FontWeight','normal');
+styles = {':','--','-'};
+widths = [2.2,2.4,2.8];
+for row = 1:2
+    for c = 1:numel(condition_names)
+        ax = nexttile(layout,(row-1)*2+c);
+        hold(ax,'on');
+        condition_color = condition_colors(c,:);
+        colors = [0.42,0.42,0.42; 0.55*condition_color; condition_color];
+        if row==1
+            shown_limits=full_xlim_um2_s;
+        else
+            shown_limits=zoom_xlim_um2_s;
+        end
+        visible=x_grid<=shown_limits(2);
+        for method = 1:3
+            density=pdfs{c,method};
+            plot(ax,x_grid(visible),density(visible),styles{method}, ...
+                'Color',colors(method,:),'LineWidth',widths(method), ...
+                'DisplayName',method_plot_label(method));
+        end
+        if row==1
+            xlim(ax,shown_limits);
+            title(ax,sprintf('%s  |  n = %d', ...
+                condition_names(c),numel(group_index{c})), ...
+                'FontSize',15,'FontWeight','normal');
+            if c==2
+                legend(ax,'Location','northeast','Box','off','FontSize',11);
+            end
+        else
+            xlim(ax,shown_limits);
+            title(ax,'Peak region','FontSize',13,'FontWeight','normal');
+        end
+        ylim(ax,[0,1.08*max(cellfun(@(q) max(q(visible)),pdfs(c,:)))]);
+        xlabel(ax,'Modeled D_{eff} (\mum^2/s)','Interpreter','tex');
+        ylabel(ax,'Probability density (s/\mum^2)','Interpreter','tex');
+        set(ax,'FontName','Arial','FontSize',12,'LineWidth',1.25, ...
+            'TickDir','out','Box','off');
+    end
+end
+annotation(fig,'textbox',[0.12,0.002,0.82,0.038], ...
+    'String',sprintf(['a uses a 1-\\mum sphere at 293 K, ', ...
+    'water viscosity in both conditions (2%%: reference only).  ', ...
+    'a/b/c: %s.  Shared log-KDE bandwidth h = %.3f.'], ...
+    variant_names(selected_variant),kde_bandwidth_log), ...
+    'EdgeColor','none','HorizontalAlignment','center', ...
+    'FontName','Arial','FontSize',10,'Color',[0.35,0.35,0.35]);
+drawnow;
+exportgraphics(fig,output_stem+".png",'Resolution',400);
+exportgraphics(fig,output_stem+".pdf",'ContentType','vector');
+savefig(fig,output_stem+".fig");
+
+%%%% SMOOTHING AUDIT FIGURE AND MACHINE-READABLE RESULTS
+audit_fig = figure('Color','w','Position',[80,80,1350,520]);
+audit_layout = tiledlayout(audit_fig,1,2,'TileSpacing','compact', ...
+    'Padding','loose');
+title(audit_layout,'Agreement after shared trajectory smoothing', ...
+    'FontName','Arial','FontSize',16,'FontWeight','normal');
+for c = 1:numel(condition_names)
+    ax = nexttile(audit_layout,c);
+    hold(ax,'on');
+    for method = 1:2
+        if method==1
+            y = overlap_a(:,c);
+            color = [0.35,0.35,0.35];
+            label = 'a: thermal';
+        else
+            y = overlap_b(:,c);
+            color = condition_colors(c,:);
+            label = 'b: DACF';
+        end
+        for order = [2,3]
+            chosen = sg_order==order;
+            if order==2
+                line_style='-'; marker='o';
+            else
+                line_style='--'; marker='s';
+            end
+            plot(ax,sg_window_frames(chosen),y(chosen), ...
+                'LineStyle',line_style,'Marker',marker,'Color',color, ...
+                'LineWidth',1.8,'MarkerSize',6, ...
+                'DisplayName',sprintf('%s | SG%d',label,order));
+        end
+        plot(ax,1,y(1),'x','Color',color, ...
+            'MarkerSize',9,'LineWidth',1.8,'HandleVisibility','off');
+    end
+    xline(ax,sg_window_frames(selected_variant),':', ...
+        'Color',[0.5,0.5,0.5],'LineWidth',1, ...
+        'HandleVisibility','off');
+    conservative_window_limit = max(sg_window_frames(eligible_smoothing))+0.5;
+    xline(ax,conservative_window_limit,'--', ...
+        'Color',[0.5,0.5,0.5],'LineWidth',1.2, ...
+        'HandleVisibility','off');
+    xlim(ax,[0,16]); ylim(ax,[0,1]);
+    xlabel(ax,'SG window (frames); x = raw; vertical dashed = 95% limit');
+    ylabel(ax,'PDF overlap with c (0–1)');
+    title(ax,condition_names(c),'FontWeight','normal');
+    set(ax,'FontName','Arial','FontSize',12,'LineWidth',1.2, ...
+        'TickDir','out','Box','off');
+    if c==2
+        legend(ax,'Location','southeast','Box','off','FontSize',10);
+    end
+end
+exportgraphics(audit_fig,output_stem+"_smoothing_audit.png", ...
+    'Resolution',300);
+exportgraphics(audit_fig,output_stem+"_smoothing_audit.pdf", ...
+    'ContentType','vector');
+
+summary = table();
+for s = 1:n_variants
+    for c = 1:numel(condition_names)
+        for method = 1:2
+            idx = group_index{c};
+            if method==1
+                candidate = a_values(s,idx)';
+            else
+                candidate = b_values(s,idx)';
+            end
+            reference = c_values(s,idx)';
+            row = table(variant_names(s),sg_order(s),sg_window_frames(s), ...
+                filter_span_s(s),rotation_amplitude_retained(s), ...
+                eligible_smoothing(s), ...
+                condition_names(c),string(char('a'+method-1)), ...
+                numel(group_index{c}),kde_bandwidth_log, ...
+                overlap_for_method(overlap_a,overlap_b,s,c,method), ...
+                median(abs(log(candidate./reference))), ...
+                corr(candidate,reference,'Type','Spearman'), ...
+                'VariableNames',{'smoothing','sg_order','window_frames', ...
+                'filter_span_s','rotation_amplitude_retained', ...
+                'within_conservative_range', ...
+                'condition','method','n_swimmers','kde_bandwidth_log', ...
+                'overlap_with_c','median_abs_log_ratio_to_c', ...
+                'spearman_rho_with_c'});
+            summary = [summary;row]; %#ok<AGROW>
+        end
+    end
+end
+writetable(summary,output_stem+"_smoothing_scores.csv");
+writetable(bandwidth_check,output_stem+"_kde_bandwidth_check.csv");
+selected_swimmers = table();
+for c = 1:numel(condition_names)
+    idx = group_index{c};
+    block = table(prior.condition(idx),prior.file(idx), ...
+        speed_um_s(selected_variant,idx)', ...
+        omega_rad_s(selected_variant,idx)', ...
+        repmat(thermal_Dr_s_inv(c),numel(idx),1), ...
+        dacf_Dr_s_inv(selected_variant,idx)', ...
+        a_values(selected_variant,idx)', ...
+        b_values(selected_variant,idx)',c_values(selected_variant,idx)', ...
+        'VariableNames',{'condition','file','speed_um_s', ...
+        'omega_rad_s','thermal_Dr_s_inv','DACF_Dr_s_inv', ...
+        'D_a_um2_s','D_b_um2_s','D_c_um2_s'});
+    selected_swimmers = [selected_swimmers;block]; %#ok<AGROW>
+end
+writetable(selected_swimmers,output_stem+"_per_swimmer.csv");
+settings = struct('baseline_csv',baseline_csv,'baseline_mat',baseline_mat, ...
+    'kde_reference_mat',kde_reference_mat, ...
+    'msd_fit_max_lag_s',msd_fit_max_lag_s, ...
+    'msd_fit_max_track_fraction',msd_fit_max_track_fraction, ...
+    'msd_fit_min_lag_span_s',msd_fit_min_lag_span_s, ...
+    'radius_um',sphere_radius_um,'temperature_K',temperature_K, ...
+    'viscosity_pa_s',viscosity_pa_s,'thermal_Dr_s_inv', ...
+    thermal_Dr_s_inv,'Dt_um2_s',Dt_um2_s, ...
+    'sg_order',sg_order,'sg_window_frames',sg_window_frames, ...
+    'variant_names',variant_names,'selected_variant',selected_variant, ...
+    'display_sg_order',display_sg_order, ...
+    'display_sg_window_frames',display_sg_window_frames, ...
+    'selected_method',method_names(selected_method_index), ...
+    'unrestricted_variant',unrestricted_variant, ...
+    'unrestricted_method',method_names(unrestricted_method_index), ...
+    'water_rotation_period_s',water_rotation_period_s, ...
+    'minimum_rotation_amplitude_retained', ...
+        minimum_rotation_amplitude_retained, ...
+    'rotation_amplitude_retained',rotation_amplitude_retained, ...
+    'eligible_smoothing',eligible_smoothing, ...
+    'kde_bandwidth_log',kde_bandwidth_log, ...
+    'kde_bandwidth_factors_checked',kde_bandwidth_factors, ...
+    'cohort_rule',"common valid a/b/c swimmers across all variants", ...
+    'smoothing_score',"mean PDF overlap with c after common smoothing", ...
+    'thermal_mucin_caveat',"2% viscosity is water proxy, not a measurement");
+save(output_stem+"_results.mat",'settings','summary','bandwidth_check', ...
+    'selected_swimmers', ...
+    'overlap_a','overlap_b','group_index','values','x_grid','pdfs','peaks', ...
+    'full_area','a_values','b_values','c_values','condition_index', ...
+    'b_included','c_included','speed_um_s','omega_rad_s', ...
+    'dacf_Dr_s_inv','dacf_r_squared','c_fit_r_squared');
+fprintf('Modes, a/b/c (um^2/s):\n');
+for c = 1:numel(condition_names)
+    fprintf('%s: %.2f / %.2f / %.2f\n', ...
+        condition_names(c),peaks(c,:));
+end
+fprintf('Saved %s.png, smoothing audit, scores, and per-swimmer table.\n', ...
+    output_stem);
+
+%%%% LOCAL FUNCTIONS
+function xy = read_curated_track(path,pixel_size_um,dt)
+    T = readtable(path,'VariableNamingRule','preserve');
+    x = double(T.X(:));
+    y = double(T.Y(:));
+    if ismember("FrameNumber",string(T.Properties.VariableNames))
+        frames = double(T.FrameNumber(:));
+    else
+        frames = (0:numel(x)-1)';
+    end
+    valid = isfinite(frames)&isfinite(x)&isfinite(y);
+    frames = frames(valid); x=x(valid); y=y(valid);
+    [frames,order] = sort(frames);
+    x=x(order); y=y(order);
+    [frames,unique_index] = unique(frames,'stable');
+    x=x(unique_index); y=y(unique_index);
+    native_t = (frames-frames(1))*dt;
+    x = (x-x(1))*pixel_size_um;
+    y = (y-y(1))*pixel_size_um;
+    if any(abs(diff(native_t)-dt)>100*eps(max(native_t(end),dt)))
+        uniform_t = (0:floor(native_t(end)/dt))'*dt;
+        x=interp1(native_t,x,uniform_t,'pchip');
+        y=interp1(native_t,y,uniform_t,'pchip');
+    end
+    xy=[x(:),y(:)];
+end
+
+function smoothed = smooth_track(xy,order,window)
+    if window==1
+        smoothed=xy;
+    else
+        smoothed=[sgolayfilt(xy(:,1),order,window), ...
+            sgolayfilt(xy(:,2),order,window)];
+    end
+end
+
+function [v,omega,tau,correlation,pair_count] = ...
+    track_motion_and_dacf(xy,dt,max_lag_s,min_step_um)
+    displacement=diff(xy,1,1);
+    length_um=hypot(displacement(:,1),displacement(:,2));
+    valid_speed=isfinite(length_um);
+    v=mean(length_um(valid_speed))/dt;
+    valid_step=valid_speed & length_um>min_step_um;
+    valid_turn=valid_step(1:end-1)&valid_step(2:end);
+    if sum(valid_turn)<3
+        omega=NaN;
+    else
+        first=displacement(1:end-1,:);
+        second=displacement(2:end,:);
+        turns=atan2(first(:,1).*second(:,2)-first(:,2).*second(:,1), ...
+            sum(first.*second,2));
+        omega=abs(mean(turns(valid_turn))/dt);
+    end
+    maximum_lag=round(max_lag_s/dt);
+    tau=(0:maximum_lag)'*dt;
+    correlation=nan(maximum_lag+1,1);
+    pair_count=zeros(maximum_lag+1,1);
+    direction=nan(size(displacement));
+    direction(valid_step,:)=displacement(valid_step,:)./length_um(valid_step);
+    n=size(direction,1);
+    for lag=0:min(maximum_lag,n-1)
+        first=direction(1:n-lag,:);
+        second=direction(1+lag:n,:);
+        valid_pair=all(isfinite(first),2)&all(isfinite(second),2);
+        pair_count(lag+1)=sum(valid_pair);
+        if any(valid_pair)
+            products=sum(first(valid_pair,:).*second(valid_pair,:),2);
+            correlation(lag+1)=mean(products);
+        end
+    end
+end
+
+function [Dr,r_squared,at_upper,converged] = ...
+    fit_individual_Dr(tau,correlation,pair_count,omega,maximum_Dr)
+    Dr=NaN; r_squared=NaN; at_upper=false; converged=false;
+    valid=tau>0 & isfinite(tau) & isfinite(correlation) & ...
+        isfinite(pair_count) & pair_count>0;
+    if sum(valid)<4 || ~isfinite(omega) || omega<0
+        return;
+    end
+    t=tau(valid);
+    y=correlation(valid);
+    weights=pair_count(valid)/mean(pair_count(valid));
+    model=@(d) exp(-d*t).*cos(omega*t);
+    objective=@(d) sum(weights.*(y-model(d)).^2);
+    search_grid=unique([0,linspace(0,maximum_Dr,100), ...
+        logspace(-6,log10(maximum_Dr),120)]);
+    objectives=arrayfun(objective,search_grid);
+    [~,best]=min(objectives);
+    lower=search_grid(max(1,best-1));
+    upper=search_grid(min(numel(search_grid),best+1));
+    options=optimset('Display','off','TolX',1e-10);
+    [candidate,~,exit_flag]=fminbnd(objective,lower,upper,options);
+    if exit_flag<=0
+        return;
+    end
+    choices=[0,search_grid(best),candidate,maximum_Dr];
+    [~,choice]=min(arrayfun(objective,choices));
+    Dr=choices(choice);
+    residual=y-model(Dr);
+    total_ss=sum((y-mean(y)).^2);
+    if total_ss<=eps
+        if sum(residual.^2)<=100*eps
+            r_squared=1;
+        else
+            r_squared=-Inf;
+        end
+    else
+        r_squared=1-sum(residual.^2)/total_ss;
+    end
+    at_upper=maximum_Dr-Dr<=1e-6*maximum_Dr;
+    converged=true;
+end
+
+function D=circle_diffusion(v,omega,Dr,Dt)
+    if any(~isfinite([v,omega,Dr,Dt])) || any([v,omega,Dr,Dt]<0)
+        D=NaN;
+    elseif v==0
+        D=Dt;
+    elseif Dr==0 && omega==0
+        D=Inf;
+    else
+        D=Dt+v^2*Dr/(2*(Dr^2+omega^2));
+    end
+end
+
+
+function [D,included,r_squared] = fit_msd_track_diffusion( ...
+    xy,dt,maximum_lag_s,maximum_track_fraction,minimum_lag_span_s, ...
+    Dt,maximum_Dr,minimum_r_squared)
+    % Same per-swimmer algebraic MSD and Marine Eq. (5) fit as
+    % analysis_2jklm.m, now applied to the already-smoothed xy.
+    n=size(xy,1);
+    maximum_lag=min(round(maximum_lag_s/dt), ...
+        floor(maximum_track_fraction*(n-1)));
+    D=NaN; included=false; r_squared=NaN;
+    if maximum_lag*dt<minimum_lag_span_s || maximum_lag<20
+        return;
+    end
+    tau=(1:maximum_lag)'*dt;
+    observed=nan(maximum_lag,1);
+    for lag=1:maximum_lag
+        squared=sum((xy(1+lag:n,:)-xy(1:n-lag,:)).^2,2);
+        observed(lag)=mean(squared(isfinite(squared)));
+    end
+    valid=isfinite(observed);
+    tau=tau(valid);
+    observed=observed(valid);
+    if numel(tau)<20
+        return;
+    end
+    fit=fit_circle_msd(tau,observed,Dt,dt,maximum_Dr);
+    r_squared=fit.r_squared;
+    D=circle_diffusion(fit.v_um_s,fit.omega_rad_s,fit.Dr_s_inv,Dt);
+    included=fit.converged && ...
+        fit.Dr_s_inv<maximum_Dr*(1-1e-5) && ...
+        fit.omega_rad_s<(pi/dt)*(1-1e-5) && ...
+        isfinite(D) && D>0 && isfinite(r_squared) && ...
+        r_squared>=minimum_r_squared;
+end
+
+function fit=fit_circle_msd(tau,observed,Dt,dt,maximum_Dr)
+    % Identical coarse grid, multistart bounds, and profiled v^2 to the
+    % single-particle MSD method in analysis_2jklm.m.
+    omega_bound=pi/dt;
+    omegas=unique(min(omega_bound, ...
+        [0,0.25,0.5,0.8,1.3,2,3.2,5,8,13,21,35]));
+    Drs=unique(min(maximum_Dr, ...
+        [0,0.015,0.05,0.15,0.4,1,2.5,6,15,40]));
+    scale=max(max(observed),1);
+    scores=inf(numel(omegas),numel(Drs));
+    for i=1:numel(omegas)
+        for j=1:numel(Drs)
+            predicted=circle_msd_profile(tau,observed,omegas(i),Drs(j),Dt);
+            scores(i,j)=sum(((predicted-observed)/scale).^2);
+        end
+    end
+    [best_by_omega,best_Dr_index]=min(scores,[],2);
+    [~,omega_order]=sort(best_by_omega);
+    selected=omega_order(1:min(7,numel(omega_order)));
+    options=optimoptions('lsqnonlin','Display','off', ...
+        'MaxIterations',180,'MaxFunctionEvaluations',700, ...
+        'FunctionTolerance',1e-10,'StepTolerance',1e-10);
+    best_score=Inf; best_q=[NaN,NaN]; best_exit_flag=-1;
+    for i=selected(:)'
+        seed=[omegas(i),Drs(best_Dr_index(i))];
+        objective=@(q) (circle_msd_profile( ...
+            tau,observed,q(1),q(2),Dt)-observed)/scale;
+        [q,~,residual,exit_flag]=lsqnonlin( ...
+            objective,seed,[0,0],[omega_bound,maximum_Dr],options);
+        score=sum(residual.^2);
+        if score<best_score
+            best_score=score;
+            best_q=q;
+            best_exit_flag=exit_flag;
+        end
+    end
+    [predicted,speed_squared]=circle_msd_profile( ...
+        tau,observed,best_q(1),best_q(2),Dt);
+    residual=predicted-observed;
+    total_ss=sum((observed-mean(observed)).^2);
+    residual_ss=sum(residual.^2);
+    if total_ss<=eps
+        if residual_ss<=100*eps
+            r_squared=1;
+        else
+            r_squared=-Inf;
+        end
+    else
+        r_squared=1-residual_ss/total_ss;
+    end
+    fit=struct('v_um_s',sqrt(speed_squared), ...
+        'omega_rad_s',best_q(1),'Dr_s_inv',best_q(2), ...
+        'r_squared',r_squared,'converged',best_exit_flag>0);
+end
+
+function [predicted,speed_squared]=circle_msd_profile( ...
+    tau,observed,omega,Dr,Dt)
+    active_unit=circle_msd(tau,1,omega,Dr,0);
+    active_target=observed-4*Dt*tau;
+    denominator=sum(active_unit.^2);
+    if denominator<=realmin
+        speed_squared=0;
+    else
+        speed_squared=max(0,sum(active_unit.*active_target)/denominator);
+    end
+    predicted=4*Dt*tau+speed_squared*active_unit;
+end
+
+function msd=circle_msd(tau,v,omega,Dr,Dt)
+    tau=tau(:);
+    z=Dr-1i*omega;
+    zt=z*tau;
+    integrated=zeros(size(tau));
+    small=abs(zt)<0.01;
+    t=tau(small);
+    integrated(small)=t.^2 .* ...
+        (1/2-z*t/6+z.^2.*t.^2/24-z.^3.*t.^3/120+z.^4.*t.^4/720);
+    if any(~small)
+        integrated(~small)=(exp(-zt(~small))-1+zt(~small))/z^2;
+    end
+    msd=4*Dt*tau+2*v^2*real(integrated);
+end
+
+function density=gaussian_log_pdf(values,z,h)
+    standardized=(z(:)'-log(values(:)))/h;
+    density=mean(exp(-0.5*standardized.^2)/(sqrt(2*pi)*h),1);
+end
+
+function density=positive_log_kde(values,x,h)
+    density=zeros(size(x));
+    positive=x>0;
+    density(positive)=gaussian_log_pdf(values,log(x(positive)),h) ...
+        ./x(positive);
+end
+
+function label=method_plot_label(method)
+    switch method
+        case 1
+            label='a  Thermal D_r reference';
+        case 2
+            label='b  Swimmer DACF D_r';
+        case 3
+            label='c  Swimmer MSD fit';
+    end
+end
+
+function score=overlap_for_method(a,b,s,c,method)
+    if method==1
+        score=a(s,c);
+    else
+        score=b(s,c);
+    end
+end

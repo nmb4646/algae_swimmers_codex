@@ -20,8 +20,16 @@ gw = 11;
 msd_mean_type = 'geometric';      % 'arithmetic' or 'geometric'
 velo_mean_type = 'geometric';     % 'arithmetic' or 'geometric'
 use_resampling = false;            % true = pchip-resample FrameNumber gaps to uniform native_dt
-show_late_fit = false;             % dashed overlay for free-alpha late fit
+show_late_fit = true;             % dashed overlay for free-alpha late fit
 show_brownian_line = false;        % plot theoretical MSD = D0*tau line
+
+% If true, estimate one period from each condition's ensemble MSD and use
+% tau/T_MSD as that condition's time coordinate. No individual-trajectory
+% periods are used.
+nondimensionalize_time_by_msd_period = true;
+msd_period_smoothing_window = 7;    % odd number of ensemble-MSD lag points
+msd_period_search_fraction = 0.50;  % search the reliable early half of the MSD
+msd_period_min_prominence_fraction = 0.03;
 
 % -------- tunable fit windows (fractions of valid MSD points) --------
 frac_ballistic = [0.00 0.03];      % alpha = 2 fit window
@@ -36,7 +44,9 @@ figure('Color','w');
 ax1 = subplot(2,1,1); hold on; grid on;
 ax2 = subplot(2,1,2); hold on; grid on;
 
-all_tau_valid = [];
+all_plot_tau_valid = [];
+msd_periods = nan(numel(condition_names), 1);
+plot_tau_ranges = nan(numel(condition_names), 2);
 
 for c = 1:numel(condition_names)
     dir_data = fullfile(base_dir, condition_dirs(c));
@@ -113,6 +123,20 @@ for c = 1:numel(condition_names)
         error('Not enough valid MSD points to fit for %s.', cond_name);
     end
 
+    if nondimensionalize_time_by_msd_period
+        [msd_periods(c), period_details] = estimate_ensemble_msd_period( ...
+            tau_valid, msd_valid, msd_period_smoothing_window, ...
+            msd_period_search_fraction, msd_period_min_prominence_fraction);
+        tau_plot = tau / msd_periods(c);
+        tau_valid_plot = tau_valid / msd_periods(c);
+        fprintf(['Ensemble-MSD period = %.6g s (first peak %.6g s, ', ...
+            'first following minimum %.6g s)\n'], msd_periods(c), ...
+            period_details.peak_time_s, period_details.minimum_time_s);
+    else
+        tau_plot = tau;
+        tau_valid_plot = tau_valid;
+    end
+
     to_idx = @(fr) max(1, min(nValid, round(fr * nValid)));
 
     idx_ball = to_idx(frac_ballistic(1)) + 1 : to_idx(frac_ballistic(2));
@@ -140,13 +164,13 @@ for c = 1:numel(condition_names)
     fprintf('Late-window fitted alpha = %.3f\n', alpha_late);
     fprintf('Late-window fitted K = %.3e m^2 / s^alpha\n', K_late);
 
-    loglog(ax1, tau, ensemble_msd, 'o-', ...
+    loglog(ax1, tau_plot, ensemble_msd, 'o-', ...
         'LineWidth', 2, ...
         'Color', colors(c,:), ...
         'DisplayName', cond_name);
 
     if show_late_fit
-        loglog(ax1, tau_valid(idx_late), fit_late, '--', ...
+        loglog(ax1, tau_valid_plot(idx_late), fit_late, '--', ...
             'LineWidth', 2.5, ...
             'Color', colors(c,:), ...
             'DisplayName', sprintf('%s late fit, \\alpha=%.2f', cond_name, alpha_late));
@@ -163,12 +187,13 @@ for c = 1:numel(condition_names)
 
     percent_err = 100 * rel_err;
 
-    plot(ax2, tau, percent_err, '-', ...
+    plot(ax2, tau_plot, percent_err, '-', ...
         'LineWidth', 2.5, ...
         'Color', colors(c,:), ...
         'DisplayName', cond_name);
 
-    all_tau_valid = [all_tau_valid; tau_valid(:)]; %#ok<AGROW>
+    all_plot_tau_valid = [all_plot_tau_valid; tau_valid_plot(:)]; %#ok<AGROW>
+    plot_tau_ranges(c,:) = [min(tau_valid_plot), max(tau_valid_plot)];
 
     fprintf('Shortest trajectory: %d frames\n', min(track_lengths));
     fprintf('Longest trajectory: %d frames\n', max(track_lengths));
@@ -178,29 +203,44 @@ for c = 1:numel(condition_names)
     fprintf('Late fit window: %d points\n', numel(idx_late));
 end
 
-xlabel(ax1, '\tau (s)');
+if nondimensionalize_time_by_msd_period
+    time_axis_label = '\tau/T_{MSD}';
+else
+    time_axis_label = '\tau (s)';
+end
+
+xlabel(ax1, time_axis_label);
 ylabel(ax1, 'Ensemble MSD(\tau) (m^2)');
 title(ax1, 'Ensemble MSD Comparison, picoalgae in 0-2% mucin');
 legend(ax1, 'Location', 'best');
 set(ax1, 'XScale', 'log');
 set(ax1, 'YScale', 'log');
 
-xlabel(ax2, '\tau (s)');
+xlabel(ax2, time_axis_label);
 ylabel(ax2, 'Error %');
 title(ax2, 'Error quantification');
 set(ax2, 'XScale', 'log');
 legend(ax2, 'Location', 'best');
 
 linkaxes([ax1, ax2], 'x');
-if ~isempty(all_tau_valid)
-    xlim(ax1, [min(all_tau_valid), max(all_tau_valid)]);
+if ~isempty(all_plot_tau_valid)
+    xlim(ax1, [min(all_plot_tau_valid), max(all_plot_tau_valid)]);
 
     if show_brownian_line
         D0 = brownian_diffusion_coefficient(1e-6);
-        tau_ref = [min(all_tau_valid), max(all_tau_valid)];
-        loglog(ax1, tau_ref, D0 * tau_ref, 'k:', ...
-            'LineWidth', 2, ...
-            'DisplayName', sprintf('MSD = D_0\\tau, D_0=%.2e m^2/s', D0));
+        if nondimensionalize_time_by_msd_period
+            for c = 1:numel(condition_names)
+                tau_ref = plot_tau_ranges(c,:);
+                loglog(ax1, tau_ref, D0 * msd_periods(c) * tau_ref, ':', ...
+                    'LineWidth', 2, 'Color', colors(c,:), ...
+                    'DisplayName', sprintf('%s Brownian reference', condition_names(c)));
+            end
+        else
+            tau_ref = [min(all_plot_tau_valid), max(all_plot_tau_valid)];
+            loglog(ax1, tau_ref, D0 * tau_ref, 'k:', ...
+                'LineWidth', 2, ...
+                'DisplayName', sprintf('MSD = D_0\\tau, D_0=%.2e m^2/s', D0));
+        end
         legend(ax1, 'Location', 'best');
     end
 end
@@ -209,6 +249,92 @@ ylim(ax2, [1, 50]);
 set(gcf, 'Position', [100, 100, 1400, 900]);
 set(ax1, 'FontSize', 15);
 set(ax2, 'FontSize', 15);
+
+function [period_s, details] = estimate_ensemble_msd_period( ...
+    tau, ensemble_msd, smoothing_window, search_fraction, ...
+    min_prominence_fraction)
+
+    tau = tau(:);
+    ensemble_msd = ensemble_msd(:);
+    if numel(tau) ~= numel(ensemble_msd) || numel(tau) < 5
+        error('At least five matching, valid ensemble-MSD points are required.');
+    end
+    if search_fraction <= 0 || search_fraction > 1
+        error('msd_period_search_fraction must be in (0, 1].');
+    end
+    if min_prominence_fraction < 0
+        error('msd_period_min_prominence_fraction must be nonnegative.');
+    end
+
+    n_points = numel(tau);
+    window = min(round(smoothing_window), n_points);
+    if mod(window, 2) == 0
+        window = window - 1;
+    end
+    if window >= 5
+        polynomial_order = min(3, window - 2);
+        smooth_log_msd = sgolayfilt(log10(ensemble_msd), ...
+            polynomial_order, window);
+    else
+        smooth_log_msd = movmean(log10(ensemble_msd), max(window, 1));
+    end
+
+    n_search = max(5, min(n_points, round(search_fraction * n_points)));
+    search_signal = smooth_log_msd(1:n_search);
+    signal_range = max(search_signal) - min(search_signal);
+    minimum_prominence = min_prominence_fraction * signal_range;
+
+    [~, peak_indices] = findpeaks(search_signal, ...
+        'MinPeakProminence', minimum_prominence);
+    if isempty(peak_indices)
+        slope = diff(search_signal);
+        peak_indices = find(slope(1:end-1) > 0 & slope(2:end) <= 0) + 1;
+    end
+    if isempty(peak_indices)
+        error(['Could not find a maximum in the ensemble MSD. Adjust the ', ...
+            'period smoothing/search settings.']);
+    end
+    peak_index = peak_indices(1);
+
+    following_indices = (peak_index + 1):n_search;
+    if numel(following_indices) < 3
+        error('Too few ensemble-MSD points remain after the first maximum.');
+    end
+    [~, relative_minima] = findpeaks(-search_signal(following_indices), ...
+        'MinPeakProminence', minimum_prominence);
+    if isempty(relative_minima)
+        following_slope = diff(search_signal(following_indices));
+        relative_minima = find(following_slope(1:end-1) < 0 & ...
+            following_slope(2:end) >= 0) + 1;
+    end
+    if isempty(relative_minima)
+        error(['Could not find a minimum after the first ensemble-MSD ', ...
+            'maximum. Adjust the period smoothing/search settings.']);
+    end
+    minimum_index = following_indices(relative_minima(1));
+
+    period_s = tau(minimum_index);
+    if minimum_index > 1 && minimum_index < n_points
+        local_indices = minimum_index + (-1:1);
+        quadratic = polyfit(tau(local_indices), smooth_log_msd(local_indices), 2);
+        refined_minimum = -quadratic(2) / (2 * quadratic(1));
+        if quadratic(1) > 0 && refined_minimum >= tau(local_indices(1)) && ...
+                refined_minimum <= tau(local_indices(end))
+            period_s = refined_minimum;
+        end
+    end
+
+    if ~isfinite(period_s) || period_s <= 0
+        error('The extracted ensemble-MSD period is not finite and positive.');
+    end
+
+    details = struct( ...
+        'peak_time_s', tau(peak_index), ...
+        'minimum_time_s', period_s, ...
+        'peak_index', peak_index, ...
+        'minimum_index', minimum_index, ...
+        'smoothed_log_msd', smooth_log_msd);
+end
 
 function [traj_data, track_lengths, used_files] = load_raw_pico_mucin_trajectories( ...
     dir_data, pix_m_per_px, native_dt, use_smoothing, go, gw, use_resampling)
